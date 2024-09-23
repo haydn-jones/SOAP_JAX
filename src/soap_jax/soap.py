@@ -1,5 +1,5 @@
 from itertools import chain
-from typing import List, NamedTuple, Union
+from typing import List, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,7 @@ def soap(
         precondition_frequency (int, optional): How often to update the preconditioner. Defaults to 10.
         max_precond_dim (int, optional): Maximum dimension of the preconditioner.
             Set to 10000 to exclude most common vocab sizes while including layers. Defaults to 10000.
+        precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.HIGHEST.
 
     Returns:
         optax.GradientTransformationExtraArgs: The SOAP optimizer.
@@ -72,6 +73,23 @@ def scale_by_soap(
     max_precond_dim: int = 10000,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> GradientTransformation:
+    """
+    Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
+
+    Args:
+        b1 (float, optional): Adam's beta1 parameter. Defaults to 0.95.
+        b2 (float, optional): Adam's beta2 parameter. Defaults to 0.95.
+        shampoo_beta (float, optional): If >= 0, use this beta for the preconditioner (`L` and `R` in paper, `GG` below)
+            moving average instead of b2. Defaults to -1.
+        eps (float, optional): Adam's epsilon for numerical stability. Defaults to 1e-8.
+        precondition_frequency (int, optional): How often to update the preconditioner. Defaults to 10.
+        max_precond_dim (int, optional): Maximum dimension of the preconditioner.
+            Set to 10000 to exclude most common vocab sizes while including layers. Defaults to 10000.
+        precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.H
+
+    Returns:
+        optax.GradientTransformationExtraArgs: The SOAP optimizer.
+    """
     shampoo_beta = shampoo_beta if shampoo_beta >= 0 else b2
 
     def init_fn(params: Updates) -> SOAPState:
@@ -119,7 +137,7 @@ def scale_by_soap(
     ) -> tuple[Updates, SOAPState]:
         # Project gradients
         grad_projected = jtu.tree_map(
-            lambda grad, q: project(grad, q),
+            lambda grad, q: project(grad, q, precision),
             updates,
             state.Q,
         )
@@ -129,14 +147,14 @@ def scale_by_soap(
         exp_avg_sq = otu.tree_update_moment_per_elem_norm(grad_projected, state.exp_avg_sq, b2, 2)
 
         exp_avg_projected = jtu.tree_map(
-            lambda e, q: project(e, q),
+            lambda e, q: project(e, q, precision),
             exp_avg,
             state.Q,
         )
 
         # Project back
         norm_updates = jtu.tree_map(
-            lambda e_avg, e_avg_sq, q: project_back(e_avg / (jnp.sqrt(e_avg_sq) + eps), q),
+            lambda e_avg, e_avg_sq, q: project_back(e_avg / (jnp.sqrt(e_avg_sq) + eps), q, precision),
             exp_avg_projected,
             exp_avg_sq,
             state.Q,
@@ -154,7 +172,7 @@ def scale_by_soap(
 
         # Update the preconditioner
         new_GG = jtu.tree_map(
-            lambda grad, gg: update_preconditioner(grad, gg, shampoo_beta),
+            lambda grad, gg: update_preconditioner(grad, gg, shampoo_beta, precision),
             updates,
             state.GG,
         )
@@ -163,7 +181,7 @@ def scale_by_soap(
         new_Q_and_exp_avg_sq = jax.lax.cond(
             state.count % precondition_frequency == 0,
             lambda: jtu.tree_map(
-                lambda e, gg, q: get_orthogonal_matrix_QR(gg, q, e),
+                lambda e, gg, q: get_orthogonal_matrix_QR(gg, q, e, precision),
                 exp_avg_sq,
                 new_GG,
                 state.Q,
@@ -196,17 +214,16 @@ def scale_by_soap(
 
         return norm_updates, new_state
 
-    def update_fn(updates: Updates, state: SOAPState, params: Updates | None = None) -> tuple[Updates, SOAPState]:
+    def update_fn(updates: Updates, state: SOAPState, params: Optional[Updates] = None) -> tuple[Updates, SOAPState]:
         del params
         count_inc = jnp.asarray(optax.safe_int32_increment(state.count))
         state = state._replace(count=count_inc)
 
-        with jax.default_matmul_precision(precision):
-            updates, new_state = jax.lax.cond(
-                count_inc == 1,
-                lambda: init_step(updates, state),
-                lambda: update_step(updates, state),
-            )
+        updates, new_state = jax.lax.cond(
+            count_inc == 1,
+            lambda: init_step(updates, state),
+            lambda: update_step(updates, state),
+        )
 
         return updates, new_state
 
@@ -217,9 +234,10 @@ def update_preconditioner(
     grad: Array,
     GG: List[Union[Array, None]],
     beta: float,
+    precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> List[Union[Array, None]]:
     if grad.ndim == 1:
-        return [lerp(GG[0], jnp.outer(grad, grad), 1 - beta)]  # type: ignore
+        return [lerp(GG[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta)]  # type: ignore
 
     new_GG = []
     for idx, gg in enumerate(GG):
@@ -231,19 +249,25 @@ def update_preconditioner(
             grad,
             grad,
             axes=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
+            precision=precision,
         )
         new_GG.append(lerp(gg, outer_product, 1 - beta))
 
     return new_GG
 
 
-def project(grad: Array, Q: List[Union[Array, None]]) -> Array:
+def project(
+    grad: Array,
+    Q: List[Union[Array, None]],
+    precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
+) -> Array:
     for mat in Q:
         if mat is not None:  # noqa: SIM108
             grad = jnp.tensordot(
                 grad,
                 mat,
                 axes=((0,), (0,)),
+                precision=precision,
             )
         else:
             permute_order = list(range(1, len(grad.shape))) + [0]
@@ -252,13 +276,18 @@ def project(grad: Array, Q: List[Union[Array, None]]) -> Array:
     return grad
 
 
-def project_back(grad: Array, Q: List[Union[Array, None]]) -> Array:
+def project_back(
+    grad: Array,
+    Q: List[Union[Array, None]],
+    precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
+) -> Array:
     for mat in Q:
         if mat is not None:  # noqa: SIM108
             grad = jnp.tensordot(
                 grad,
                 mat,
                 axes=((0,), (1,)),
+                precision=precision,
             )
         else:
             grad = jnp.moveaxis(grad, 0, -1)
@@ -278,6 +307,7 @@ def get_orthogonal_matrix_QR(
     GG: List[Union[Array, None]],
     Q: List[Union[Array, None]],
     exp_avg_sq: Array,
+    precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> tuple[List[Union[Array, None]], Array]:
     final_Q = []
     for ind, (m, o) in enumerate(zip(GG, Q)):
@@ -285,11 +315,17 @@ def get_orthogonal_matrix_QR(
             final_Q.append(None)
             continue
 
-        est_eig = jnp.diag(o.T @ m @ o)
+        est_eig = jnp.diag(
+            jnp.matmul(
+                jnp.matmul(o.T, m, precision=precision),
+                o,
+                precision=precision,
+            )
+        )
         sort_idx = jnp.argsort(est_eig, descending=True)
         exp_avg_sq = jnp.take(exp_avg_sq, sort_idx, axis=ind)
         o = o[:, sort_idx]
-        power_iter = m @ o
+        power_iter = jnp.matmul(m, o, precision=precision)
         Q_new, _ = jnp.linalg.qr(power_iter)
 
         final_Q.append(Q_new)
