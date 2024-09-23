@@ -1,0 +1,29 @@
+[project]
+name = "soap-jax"
+version = "0.1.0"
+description = "SOAP Optimizer implemented in JAX"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "jax",
+    "jaxtyping",
+    "optax",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "SIM", "I", "FURB"]
+ignore = ["B905"]
+fixable = ["ALL"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
