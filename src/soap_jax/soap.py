@@ -28,6 +28,7 @@ def soap(
     weight_decay: float = 0.0,
     precondition_frequency: int = 10,
     max_precond_dim: int = 10000,
+    precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> optax.GradientTransformationExtraArgs:
     """
@@ -44,6 +45,8 @@ def soap(
         precondition_frequency (int, optional): How often to update the preconditioner. Defaults to 10.
         max_precond_dim (int, optional): Maximum dimension of the preconditioner.
             Set to 10000 to exclude most common vocab sizes while including layers. Defaults to 10000.
+        precondition_1d (bool, optional): Whether to precondition 1D gradients. If False, 1D params use Adam-style
+            updates. Defaults to False.
         precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.HIGHEST.
 
     Returns:
@@ -57,6 +60,7 @@ def soap(
             eps=eps,
             precondition_frequency=precondition_frequency,
             max_precond_dim=max_precond_dim,
+            precondition_1d=precondition_1d,
             precision=precision,
         ),
         optax.add_decayed_weights(weight_decay),
@@ -71,6 +75,7 @@ def scale_by_soap(
     eps: float = 1e-8,
     precondition_frequency: int = 10,
     max_precond_dim: int = 10000,
+    precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> GradientTransformation:
     """
@@ -85,6 +90,8 @@ def scale_by_soap(
         precondition_frequency (int, optional): How often to update the preconditioner. Defaults to 10.
         max_precond_dim (int, optional): Maximum dimension of the preconditioner.
             Set to 10000 to exclude most common vocab sizes while including layers. Defaults to 10000.
+        precondition_1d (bool, optional): Whether to precondition 1D gradients. If False, 1D params use Adam-style
+            updates. Defaults to False.
         precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.H
 
     Returns:
@@ -96,11 +103,11 @@ def scale_by_soap(
         exp_avg = otu.tree_zeros_like(params)
         exp_avg_sq = otu.tree_zeros_like(params)
         GG = jtu.tree_map(
-            lambda p: init_conditioner(p, max_precond_dim),
+            lambda p: init_conditioner(p, max_precond_dim, precondition_1d),
             params,
         )
         Q = jtu.tree_map(
-            lambda p: init_conditioner(p, max_precond_dim),
+            lambda p: init_conditioner(p, max_precond_dim, precondition_1d),
             params,
         )
         return SOAPState(
@@ -237,6 +244,8 @@ def update_preconditioner(
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> List[Union[Array, None]]:
     if grad.ndim == 1:
+        if GG[0] is None:
+            return GG
         return [lerp(GG[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta)]  # type: ignore
 
     new_GG = []
@@ -341,8 +350,14 @@ def lerp(
     return start + weight * (end - start)
 
 
-def init_conditioner(p: Array, max_precond_dim: int) -> List[Union[Array, None]]:
+def init_conditioner(
+    p: Array,
+    max_precond_dim: int,
+    precondition_1d: bool,
+) -> List[Union[Array, None]]:
     if p.ndim == 1:
+        if not precondition_1d or p.shape[0] > max_precond_dim:
+            return [None]
         return [jnp.zeros((p.shape[0], p.shape[0]))]
 
     return [jnp.zeros((s, s)) if s <= max_precond_dim else None for s in p.shape]
