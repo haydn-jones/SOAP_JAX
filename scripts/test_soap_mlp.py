@@ -1,22 +1,27 @@
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.training import train_state
+import optax
 
 from soap_jax import soap
 
 
-class MLP(nn.Module):
-    hidden_sizes: tuple[int, ...]
-    out_dim: int
+class MLP(eqx.Module):
+    layers: list
 
-    @nn.compact
+    def __init__(self, key: jax.Array, in_dim: int, hidden_sizes: tuple[int, ...], out_dim: int):
+        keys = jax.random.split(key, len(hidden_sizes) + 1)
+
+        dims = [in_dim] + list(hidden_sizes)
+        self.layers = []
+        for i, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:])):
+            self.layers.append(eqx.nn.Linear(d_in, d_out, key=keys[i]))
+        self.layers.append(eqx.nn.Linear(dims[-1], out_dim, key=keys[-1]))
+
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        for width in self.hidden_sizes:
-            x = nn.Dense(width)(x)
-            x = nn.tanh(x)
-
-        return nn.Dense(self.out_dim)(x)
+        for layer in self.layers[:-1]:
+            x = jnp.tanh(layer(x))
+        return self.layers[-1](x)
 
 
 def make_data(
@@ -38,61 +43,54 @@ def make_data(
     return x, y
 
 
-def create_state(
-    key: jax.Array,
-    model: nn.Module,
-    x: jnp.ndarray,
-    tx,
-) -> train_state.TrainState:
-    params = model.init(key, x)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
-
-def compute_loss(params: dict, apply_fn, x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    preds = apply_fn(params, x)
+def compute_loss(model: MLP, x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    preds = jax.vmap(model)(x)
     return jnp.mean((preds - y) ** 2)
 
 
-@jax.jit
+@eqx.filter_jit
 def train_step(
-    state: train_state.TrainState, x: jnp.ndarray, y: jnp.ndarray
-) -> tuple[train_state.TrainState, jnp.ndarray]:
-    def loss_fn(params: dict) -> jnp.ndarray:
-        return compute_loss(params, state.apply_fn, x, y)
-
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss
+    model: MLP, opt_state: optax.OptState, x: jnp.ndarray, y: jnp.ndarray, optimizer: optax.GradientTransformation
+) -> tuple[MLP, optax.OptState, jnp.ndarray]:
+    loss, grads = eqx.filter_value_and_grad(compute_loss)(model, x, y)
+    updates, opt_state = optimizer.update(grads, opt_state, model)  # ty:ignore[invalid-argument-type]
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, loss
 
 
 def main() -> None:
     key = jax.random.PRNGKey(0)
+    key, model_key = jax.random.split(key)
 
     x, y = make_data(key)
 
-    model = MLP(hidden_sizes=(64, 64), out_dim=y.shape[-1])
-    tx = soap(
+    model = MLP(model_key, in_dim=x.shape[-1], hidden_sizes=(256, 256, 256, 256), out_dim=y.shape[-1])
+    optimizer = soap(
         learning_rate=3e-3,
-        precondition_frequency=1,
+        precondition_frequency=5,
         precondition_1d=False,
+        weight_decay=0.01,
     )
-    state = create_state(jax.random.PRNGKey(1), model, x, tx)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    initial_loss = compute_loss(state.params, state.apply_fn, x, y)  # ty:ignore[invalid-argument-type]
+    initial_loss = compute_loss(model, x, y)
 
     for _ in range(200):
-        state, _ = train_step(state, x, y)
-        loss = compute_loss(state.params, state.apply_fn, x, y)
+        model, opt_state, _ = train_step(model, opt_state, x, y, optimizer)
+        loss = compute_loss(model, x, y)
         print(f"loss={float(loss):.6f}")
 
-    final_loss = compute_loss(state.params, state.apply_fn, x, y)  # ty:ignore[invalid-argument-type]
+    final_loss = compute_loss(model, x, y)
 
     initial_val = float(initial_loss)
     final_val = float(final_loss)
 
+    bound = 0.3
     print(f"initial_loss={initial_val:.6f} final_loss={final_val:.6f}")
-    if not final_val < initial_val * 0.5:
-        raise AssertionError("Expected loss to drop by at least 50%.")
+    if not final_val < initial_val * bound:
+        raise AssertionError(
+            f"Expected loss to drop by at least {1 - bound:.0%}, but got {1 - final_val / initial_val:.2%}"
+        )
 
 
 if __name__ == "__main__":

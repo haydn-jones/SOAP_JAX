@@ -1,5 +1,11 @@
 # SOAP_JAX
 
+## Update 01/09/2026
+I saw that a number of people have been using this implementation, so I took the time to ensure it was more aligned with the official implementation and corrected some potential issues with tree leaves (I had never observed the issue, but I addressed it anyway). Also added optional 1D preconditioning.
+
+The main fix was that the EMA updates were stale on off-precondition steps. After fixing, early steps may see slower convergence (compared to previous implementation) but this aligns with the official implementation. Your runs will now be different than before and if that is an issue just pin to `v0.1.0`.
+
+## About
 This is an *unofficial* JAX implementation of the SOAP optimizer from [SOAP: Improving and Stabilizing Shampoo using Adam](https://arxiv.org/abs/2409.11321), based on the official PyTorch implementation found here https://github.com/nikhilvyas/SOAP.
 
 You can install this with
@@ -25,6 +31,4 @@ opt = soap(
 I've written it similarly to how optimizers in optax are defined, so you can also import `scale_by_soap` for just the gradient transformation.
 
 ## JAX Specific Information
-I did not implement merging of dimensions. Optionally preconditioning 1D parameters is supported via `precondition_1d`. When `precondition_1d=False`, 1D parameters still follow the global SOAP init step, so they see a one-step update lag compared to Adam. I'll gladly take PR's improving other parts of the implementation as well.
-
-The runs I've done with this implementation have gotten pretty good results so I expect that what I've done here is correct, but as always with unofficial implementations, review the code if you're going to do something important.
+I did not implement merging of dimensions. I'll gladly take PR's improving other parts of the implementation as well.
