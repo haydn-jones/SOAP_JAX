@@ -4,7 +4,12 @@ version = "0.2.0"
 description = "SOAP Optimizer implemented in JAX"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-dependencies = ["jax", "jaxtyping", "optax"]
+dependencies = [
+    "chex>=0.1.90",
+    "jax",
+    "jaxtyping",
+    "optax",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.5"]
@@ -25,4 +30,11 @@ quote-style = "double"
 indent-style = "space"
 
 [dependency-groups]
-dev = ["equinox>=0.13.2", "jax[cuda13]>0.6.0"]
+dev = [
+    "equinox>=0.13.2",
+    "flax>=0.10.7",
+    "ipython>=8.39.0",
+    "jax[cuda13]>0.6.0 ; sys_platform == 'linux'",
+    "pytest>=9.0.3",
+    "ty>=0.0.31",
+]
