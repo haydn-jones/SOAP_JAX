@@ -492,7 +492,7 @@ def _map_preconditioner(
 
 
 def _maybe_preconditioner_matrices(value: PreconditionerLike) -> Optional[Preconditioner]:
-    if isinstance(value, tuple) and len(value) > 0 and all(_is_preconditioner_matrix(m) for m in value):
+    if isinstance(value, tuple) and all(_is_preconditioner_matrix(m) for m in value):
         return value
 
     if not isinstance(value, Mapping):

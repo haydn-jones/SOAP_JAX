@@ -15,6 +15,14 @@ class TinyMLP(nnx.Module):
         return self.linear2(x)
 
 
+class ScalarGainModel(nnx.Module):
+    def __init__(self, initial_gain: float = 0.5):
+        self.gain = nnx.Param(jnp.asarray(initial_gain, dtype=jnp.float32))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.gain[...] * x
+
+
 def make_data(
     key: jax.Array,
     num_samples: int = 64,
@@ -29,13 +37,13 @@ def make_data(
     return x, y
 
 
-def compute_loss(model: TinyMLP, x: jax.Array, y: jax.Array) -> jax.Array:
+def compute_loss(model: nnx.Module, x: jax.Array, y: jax.Array) -> jax.Array:
     predictions = model(x)
     return jnp.mean((predictions - y) ** 2)
 
 
 @nnx.jit
-def train_step(model: TinyMLP, optimizer: nnx.Optimizer, x: jax.Array, y: jax.Array) -> jax.Array:
+def train_step(model: nnx.Module, optimizer: nnx.Optimizer, x: jax.Array, y: jax.Array) -> jax.Array:
     loss, grads = nnx.value_and_grad(compute_loss, argnums=nnx.DiffState(0, nnx.Param))(model, x, y)
     optimizer.update(model, grads)
     return loss
@@ -67,3 +75,29 @@ def test_soap_trains_a_small_flax_nnx_mlp() -> None:
 
     assert final_loss < initial_loss * 0.5
     assert int(optimizer.step.value) == 40
+
+
+def test_soap_handles_scalar_flax_nnx_params() -> None:
+    x = jnp.linspace(-1.0, 1.0, 64, dtype=jnp.float32)[:, None]
+    y = 2.0 * x
+
+    model = ScalarGainModel()
+    optimizer = nnx.Optimizer(
+        model,
+        soap(
+            learning_rate=1e-1,
+            precondition_frequency=2,
+            precondition_1d=False,
+            weight_decay=0.0,
+        ),
+        wrt=nnx.Param,
+    )
+
+    initial_loss = float(compute_loss(model, x, y))
+
+    for _ in range(20):
+        train_step(model, optimizer, x, y)
+
+    final_loss = float(compute_loss(model, x, y))
+
+    assert final_loss < initial_loss * 0.1
