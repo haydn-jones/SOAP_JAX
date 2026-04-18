@@ -1,5 +1,6 @@
+from collections.abc import Mapping
 from itertools import chain
-from typing import Callable, Iterable, NamedTuple, Optional, Union
+from typing import Callable, NamedTuple, Optional, Protocol, TypeAlias, Union, cast
 
 import chex
 import jax
@@ -11,27 +12,18 @@ from chex import Numeric
 from jaxtyping import Array
 from optax import GradientTransformation, Updates
 
-PreconditionerMatrix = Union[Array, None]
+
+class SupportsShapeDtype(Protocol):
+    shape: tuple[int, ...]
+    dtype: chex.ArrayDType
 
 
-@jtu.register_pytree_node_class
-class Preconditioner:
-    """Per-parameter preconditioner matrices (None for dimensions exceeding max_precond_dim)."""
-
-    __slots__ = ("matrices",)
-
-    def __init__(self, matrices: Iterable[PreconditionerMatrix]):
-        self.matrices = tuple(matrices)
-
-    def tree_flatten(self) -> tuple[tuple[PreconditionerMatrix, ...], None]:
-        return (self.matrices, None)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: None, children: tuple[PreconditionerMatrix, ...]) -> "Preconditioner":
-        return cls(children)
-
-    def map(self, fn: Callable[[PreconditionerMatrix], PreconditionerMatrix]) -> "Preconditioner":
-        return Preconditioner(fn(m) for m in self.matrices)
+PreconditionerMatrix: TypeAlias = Array | None
+Preconditioner: TypeAlias = tuple[PreconditionerMatrix, ...]
+PreconditionerMatrixLike: TypeAlias = PreconditionerMatrix | SupportsShapeDtype
+IndexedPreconditionerState: TypeAlias = Mapping[int, PreconditionerMatrixLike]
+LegacyPreconditionerState: TypeAlias = Mapping[str, IndexedPreconditionerState]
+PreconditionerLike: TypeAlias = Preconditioner | IndexedPreconditionerState | LegacyPreconditionerState
 
 
 class SOAPState(NamedTuple):
@@ -59,7 +51,7 @@ def soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> optax.GradientTransformationExtraArgs:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -117,7 +109,7 @@ def scale_by_soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> GradientTransformation:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -138,7 +130,7 @@ def scale_by_soap(
         mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
         qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
-            Defaults to float32 to avoid float64 upcasts in mixed precision.
+            Defaults to float.
 
     Returns:
         GradientTransformation: The SOAP gradient transformation.
@@ -170,7 +162,7 @@ def scale_by_soap(
             params,
         )
         return SOAPState(
-            count=jnp.zeros([], jnp.int32),
+            count=jnp.zeros([], int),
             exp_avg=exp_avg,
             exp_avg_sq=exp_avg_sq,
             GG=GG,
@@ -189,7 +181,7 @@ def scale_by_soap(
         )
 
         new_Q = jtu.tree_map(
-            lambda gg: gg.map(lambda m: get_orthogonal_matrix(m, qr_dtype)),
+            lambda gg: _map_preconditioner(gg, lambda m: get_orthogonal_matrix(m, qr_dtype)),
             new_GG,
             is_leaf=_is_preconditioner,
         )
@@ -298,7 +290,11 @@ def scale_by_soap(
     def update_fn(updates: Updates, state: SOAPState, params: Optional[Updates] = None) -> tuple[Updates, SOAPState]:
         del params
         count_inc = jnp.asarray(optax.safe_int32_increment(state.count))
-        state = state._replace(count=count_inc)
+        state = state._replace(
+            count=count_inc,
+            GG=jtu.tree_map(_preconditioner_matrices, state.GG, is_leaf=_is_preconditioner),
+            Q=jtu.tree_map(_preconditioner_matrices, state.Q, is_leaf=_is_preconditioner),
+        )
 
         updates, new_state = jax.lax.cond(
             count_inc == 1,
@@ -320,7 +316,7 @@ def add_decayed_weights_post(
 
     def init_fn(params: Updates) -> PostDecayState:
         del params
-        return PostDecayState(count=jnp.zeros([], jnp.int32))
+        return PostDecayState(count=jnp.zeros([], int))
 
     def update_fn(
         updates: Updates, state: PostDecayState, params: Optional[Updates] = None
@@ -344,15 +340,14 @@ def update_preconditioner(
     beta: float,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Preconditioner:
+    GG = _preconditioner_matrices(GG)
     if grad.ndim == 1:
-        if GG.matrices[0] is None:
+        if GG[0] is None:
             return GG
-        return Preconditioner(
-            [lerp(GG.matrices[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta)]
-        )
+        return (lerp(GG[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta),)
 
     new_GG = []
-    for idx, gg in enumerate(GG.matrices):
+    for idx, gg in enumerate(GG):
         if gg is None:
             new_GG.append(None)
             continue
@@ -365,7 +360,7 @@ def update_preconditioner(
         )
         new_GG.append(lerp(gg, outer_product, 1 - beta))
 
-    return Preconditioner(new_GG)
+    return tuple(new_GG)
 
 
 def project(
@@ -373,7 +368,8 @@ def project(
     Q: Preconditioner,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
-    for mat in Q.matrices:
+    Q = _preconditioner_matrices(Q)
+    for mat in Q:
         if mat is not None:
             grad = jnp.tensordot(
                 grad,
@@ -393,7 +389,8 @@ def project_back(
     Q: Preconditioner,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
-    for mat in Q.matrices:
+    Q = _preconditioner_matrices(Q)
+    for mat in Q:
         if mat is not None:
             grad = jnp.tensordot(
                 grad,
@@ -425,10 +422,12 @@ def get_orthogonal_matrix_QR(
     Q: Preconditioner,
     exp_avg_sq: Array,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> tuple[Preconditioner, Array]:
+    GG = _preconditioner_matrices(GG)
+    Q = _preconditioner_matrices(Q)
     final_Q = []
-    for ind, (m, o) in enumerate(zip(GG.matrices, Q.matrices)):
+    for ind, (m, o) in enumerate(zip(GG, Q)):
         if m is None or o is None:
             final_Q.append(None)
             continue
@@ -452,7 +451,7 @@ def get_orthogonal_matrix_QR(
             Q_new = Q_new.astype(m.dtype)
         final_Q.append(Q_new)
 
-    return Preconditioner(final_Q), exp_avg_sq
+    return tuple(final_Q), exp_avg_sq
 
 
 def lerp(
@@ -471,14 +470,52 @@ def init_conditioner(
 ) -> Preconditioner:
     if p.ndim == 1:
         if not precondition_1d or p.shape[0] > max_precond_dim:
-            return Preconditioner([None])
-        return Preconditioner([jnp.zeros((p.shape[0], p.shape[0]), dtype=dtype)])
+            return (None,)
+        return (jnp.zeros((p.shape[0], p.shape[0]), dtype=dtype),)
 
-    return Preconditioner([jnp.zeros((s, s), dtype=dtype) if s <= max_precond_dim else None for s in p.shape])
+    return tuple(jnp.zeros((s, s), dtype=dtype) if s <= max_precond_dim else None for s in p.shape)
 
 
-def _is_preconditioner(value: object) -> bool:
-    return isinstance(value, Preconditioner)
+def _is_preconditioner(value: PreconditionerLike) -> bool:
+    return _maybe_preconditioner_matrices(value) is not None
+
+
+def _is_preconditioner_matrix(value: PreconditionerMatrixLike) -> bool:
+    return value is None or (hasattr(value, "shape") and hasattr(value, "dtype"))
+
+
+def _map_preconditioner(
+    preconditioner: PreconditionerLike,
+    fn: Callable[[PreconditionerMatrix], PreconditionerMatrix],
+) -> Preconditioner:
+    return tuple(fn(m) for m in _preconditioner_matrices(preconditioner))
+
+
+def _maybe_preconditioner_matrices(value: PreconditionerLike) -> Optional[Preconditioner]:
+    if isinstance(value, tuple) and all(_is_preconditioner_matrix(m) for m in value):
+        return value
+
+    if not isinstance(value, Mapping):
+        return None
+
+    if "matrices" in value:
+        return _maybe_preconditioner_matrices(cast(LegacyPreconditionerState, value)["matrices"])
+
+    keys = tuple(value.keys())
+    if len(keys) > 0 and all(isinstance(k, int) for k in keys):
+        indexed_state = cast(IndexedPreconditionerState, value)
+        matrices = tuple(indexed_state[k] for k in sorted(keys))
+        if all(_is_preconditioner_matrix(m) for m in matrices):
+            return cast(Preconditioner, matrices)
+
+    return None
+
+
+def _preconditioner_matrices(value: PreconditionerLike) -> Preconditioner:
+    matrices = _maybe_preconditioner_matrices(value)
+    if matrices is None:
+        raise TypeError(f"Expected a preconditioner leaf, got {type(value)!r}")
+    return matrices
 
 
 def _resolve_learning_rate(learning_rate: optax.ScalarOrSchedule, count: Array) -> Array:
