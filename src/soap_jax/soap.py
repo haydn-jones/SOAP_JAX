@@ -59,7 +59,7 @@ def soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> optax.GradientTransformationExtraArgs:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -117,7 +117,7 @@ def scale_by_soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> GradientTransformation:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -170,7 +170,7 @@ def scale_by_soap(
             params,
         )
         return SOAPState(
-            count=jnp.zeros([], jnp.int32),
+            count=jnp.zeros([], int),
             exp_avg=exp_avg,
             exp_avg_sq=exp_avg_sq,
             GG=GG,
@@ -320,7 +320,7 @@ def add_decayed_weights_post(
 
     def init_fn(params: Updates) -> PostDecayState:
         del params
-        return PostDecayState(count=jnp.zeros([], jnp.int32))
+        return PostDecayState(count=jnp.zeros([], int))
 
     def update_fn(
         updates: Updates, state: PostDecayState, params: Optional[Updates] = None
@@ -425,7 +425,7 @@ def get_orthogonal_matrix_QR(
     Q: Preconditioner,
     exp_avg_sq: Array,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: chex.ArrayDType = float,
 ) -> tuple[Preconditioner, Array]:
     final_Q = []
     for ind, (m, o) in enumerate(zip(GG.matrices, Q.matrices)):
