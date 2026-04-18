@@ -50,7 +50,7 @@ def test_soap_trains_a_small_flax_nnx_mlp() -> None:
     optimizer = nnx.Optimizer(
         model,
         soap(
-            learning_rate=1e-2,
+            learning_rate=3e-2,
             precondition_frequency=2,
             precondition_1d=False,
             weight_decay=0.0,
