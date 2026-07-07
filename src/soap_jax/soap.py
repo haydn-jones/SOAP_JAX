@@ -9,8 +9,12 @@ import optax
 import optax.tree_utils as otu
 from chex import Numeric
 from jaxtyping import Array
-from flax.nnx.variablelib import Variable
 from optax import GradientTransformation, Updates
+
+try:
+    from flax.nnx.variablelib import Variable as NnxVariable
+except ImportError:
+    NnxVariable = None
 
 PreconditionerMatrix = Union[Array, None]
 
@@ -160,11 +164,12 @@ def scale_by_soap(
     shampoo_beta = shampoo_beta if shampoo_beta >= 0 else b2
 
     def init_fn(params: Updates) -> SOAPState:
-        params = jtu.tree_map(
-            lambda p: p.get_value() if isinstance(p, Variable) else p,
-            params,
-            is_leaf=lambda x: isinstance(x, Variable),
-        )
+        if NnxVariable is not None:
+            params = jtu.tree_map(
+                lambda p: p.get_value() if isinstance(p, NnxVariable) else p,
+                params,
+                is_leaf=lambda x: isinstance(x, NnxVariable),
+            )
         exp_avg = otu.tree_zeros_like(params, dtype=mu_dtype)
         exp_avg_sq = otu.tree_zeros_like(params, dtype=mu_dtype)
         GG = jtu.tree_map(
