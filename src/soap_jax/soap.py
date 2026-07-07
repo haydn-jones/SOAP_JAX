@@ -12,7 +12,7 @@ from jaxtyping import Array
 from optax import GradientTransformation, Updates
 
 try:
-    from flax.nnx.variablelib import Variable as NnxVariable
+    from flax.nnx import Variable as NnxVariable
 except ImportError:
     NnxVariable = None
 
