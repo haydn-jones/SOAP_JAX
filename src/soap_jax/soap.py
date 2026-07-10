@@ -64,7 +64,7 @@ def soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: Optional[chex.ArrayDType] = None,
 ) -> optax.GradientTransformationExtraArgs:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -87,7 +87,9 @@ def soap(
         mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
         qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
-            Defaults to float32 to avoid float64 upcasts in mixed precision.
+            If None, follows each parameter's dtype (so float64 params get float64 preconditioners). Set
+            explicitly (e.g. float32) to force a lower precision for the preconditioner in mixed-precision
+            training. Defaults to None.
 
     Returns:
         optax.GradientTransformationExtraArgs: The SOAP optimizer.
@@ -122,7 +124,7 @@ def scale_by_soap(
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: Optional[chex.ArrayDType] = None,
 ) -> GradientTransformation:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -143,7 +145,9 @@ def scale_by_soap(
         mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
         qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
-            Defaults to float32 to avoid float64 upcasts in mixed precision.
+            If None, follows each parameter's dtype (so float64 params get float64 preconditioners). Set
+            explicitly (e.g. float32) to force a lower precision for the preconditioner in mixed-precision
+            training. Defaults to None.
 
     Returns:
         GradientTransformation: The SOAP gradient transformation.
@@ -245,9 +249,11 @@ def scale_by_soap(
             bc2 = 1 - b2**effective_step
             corr = jnp.sqrt(bc2) / bc1
 
-            # Bias correction on the updates
+            # Bias correction on the updates. Cast back to each leaf's dtype: with jax_enable_x64,
+            # `corr` may be float64 and would otherwise upcast float32 updates, breaking the dtype
+            # match required by the surrounding jax.lax.cond branches.
             norm_updates = jtu.tree_map(
-                lambda p: p * corr,
+                lambda p: (p * corr).astype(p.dtype),
                 norm_updates,
             )
 
@@ -356,11 +362,13 @@ def update_preconditioner(
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Preconditioner:
     if grad.ndim == 1:
-        if GG.matrices[0] is None:
+        gg0 = GG.matrices[0]
+        if gg0 is None:
             return GG
-        return Preconditioner(
-            [lerp(GG.matrices[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta)]
-        )
+        outer_product = jnp.matmul(grad[:, None], grad[None, :], precision=precision)
+        # Keep the preconditioner in its stored dtype: without this cast, a float64 gradient would
+        # silently upcast a float32 preconditioner, breaking dtype consistency across steps.
+        return Preconditioner([lerp(gg0, outer_product, 1 - beta).astype(gg0.dtype)])
 
     new_GG = []
     for idx, gg in enumerate(GG.matrices):
@@ -374,7 +382,7 @@ def update_preconditioner(
             axes=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
             precision=precision,
         )
-        new_GG.append(lerp(gg, outer_product, 1 - beta))
+        new_GG.append(lerp(gg, outer_product, 1 - beta).astype(gg.dtype))
 
     return Preconditioner(new_GG)
 
@@ -384,6 +392,7 @@ def project(
     Q: Preconditioner,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
+    in_dtype = grad.dtype
     for mat in Q.matrices:
         if mat is not None:
             grad = jnp.tensordot(
@@ -396,7 +405,9 @@ def project(
             permute_order = list(range(1, len(grad.shape))) + [0]
             grad = jnp.transpose(grad, permute_order)
 
-    return grad
+    # Preserve the gradient's dtype: a preconditioner stored in a different precision (e.g. a float64
+    # Q with float32 params) must not silently change the projected gradient's dtype.
+    return grad.astype(in_dtype)
 
 
 def project_back(
@@ -404,6 +415,7 @@ def project_back(
     Q: Preconditioner,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
+    in_dtype = grad.dtype
     for mat in Q.matrices:
         if mat is not None:
             grad = jnp.tensordot(
@@ -415,13 +427,15 @@ def project_back(
         else:
             grad = jnp.moveaxis(grad, 0, -1)
 
-    return grad
+    return grad.astype(in_dtype)
 
 
-def get_orthogonal_matrix(gg: Union[Array, None], qr_dtype: chex.ArrayDType) -> Union[Array, None]:
+def get_orthogonal_matrix(gg: Union[Array, None], qr_dtype: Optional[chex.ArrayDType]) -> Union[Array, None]:
     if gg is None:
         return None
 
+    if qr_dtype is None:
+        qr_dtype = gg.dtype
     gg_mat = gg.astype(qr_dtype) if gg.dtype != qr_dtype else gg
     jitter = jnp.asarray(1e-30, dtype=qr_dtype)
     _, eigh = jnp.linalg.eigh(gg_mat + jitter * jnp.eye(gg_mat.shape[0], dtype=qr_dtype))
@@ -436,7 +450,7 @@ def get_orthogonal_matrix_QR(
     Q: Preconditioner,
     exp_avg_sq: Array,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    qr_dtype: chex.ArrayDType = jnp.float32,
+    qr_dtype: Optional[chex.ArrayDType] = None,
 ) -> tuple[Preconditioner, Array]:
     final_Q = []
     for ind, (m, o) in enumerate(zip(GG.matrices, Q.matrices)):
@@ -444,8 +458,9 @@ def get_orthogonal_matrix_QR(
             final_Q.append(None)
             continue
 
-        m_mat = m.astype(qr_dtype) if m.dtype != qr_dtype else m
-        o_mat = o.astype(qr_dtype) if o.dtype != qr_dtype else o
+        compute_dtype = m.dtype if qr_dtype is None else qr_dtype
+        m_mat = m.astype(compute_dtype) if m.dtype != compute_dtype else m
+        o_mat = o.astype(compute_dtype) if o.dtype != compute_dtype else o
         est_eig = jnp.diag(
             jnp.matmul(
                 jnp.matmul(o_mat.T, m_mat, precision=precision),
@@ -478,8 +493,12 @@ def init_conditioner(
     p: Array,
     max_precond_dim: int,
     precondition_1d: bool,
-    dtype: chex.ArrayDType,
+    dtype: Optional[chex.ArrayDType],
 ) -> Preconditioner:
+    # If no dtype is requested, store the preconditioner in the parameter's own dtype so that
+    # float64 parameters produce float64 preconditioners (and stay consistent across steps).
+    if dtype is None:
+        dtype = p.dtype
     if p.ndim == 1:
         if not precondition_1d or p.shape[0] > max_precond_dim:
             return Preconditioner([None])
