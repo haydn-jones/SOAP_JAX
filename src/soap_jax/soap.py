@@ -87,9 +87,7 @@ def soap(
         mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
         qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
-            If None, follows each parameter's dtype (so float64 params get float64 preconditioners). Set
-            explicitly (e.g. float32) to force a lower precision for the preconditioner in mixed-precision
-            training. Defaults to None.
+            If None, follows each parameter's dtype. Defaults to None.
 
     Returns:
         optax.GradientTransformationExtraArgs: The SOAP optimizer.
@@ -145,9 +143,7 @@ def scale_by_soap(
         mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
         qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
-            If None, follows each parameter's dtype (so float64 params get float64 preconditioners). Set
-            explicitly (e.g. float32) to force a lower precision for the preconditioner in mixed-precision
-            training. Defaults to None.
+            If None, follows each parameter's dtype. Defaults to None.
 
     Returns:
         GradientTransformation: The SOAP gradient transformation.
@@ -249,9 +245,7 @@ def scale_by_soap(
             bc2 = 1 - b2**effective_step
             corr = jnp.sqrt(bc2) / bc1
 
-            # Bias correction on the updates. Cast back to each leaf's dtype: with jax_enable_x64,
-            # `corr` may be float64 and would otherwise upcast float32 updates, breaking the dtype
-            # match required by the surrounding jax.lax.cond branches.
+            # Bias correction on the updates.
             norm_updates = jtu.tree_map(
                 lambda p: (p * corr).astype(p.dtype),
                 norm_updates,
@@ -366,8 +360,6 @@ def update_preconditioner(
         if gg0 is None:
             return GG
         outer_product = jnp.matmul(grad[:, None], grad[None, :], precision=precision)
-        # Keep the preconditioner in its stored dtype: without this cast, a float64 gradient would
-        # silently upcast a float32 preconditioner, breaking dtype consistency across steps.
         return Preconditioner([lerp(gg0, outer_product, 1 - beta).astype(gg0.dtype)])
 
     new_GG = []
@@ -405,8 +397,6 @@ def project(
             permute_order = list(range(1, len(grad.shape))) + [0]
             grad = jnp.transpose(grad, permute_order)
 
-    # Preserve the gradient's dtype: a preconditioner stored in a different precision (e.g. a float64
-    # Q with float32 params) must not silently change the projected gradient's dtype.
     return grad.astype(in_dtype)
 
 
@@ -495,8 +485,6 @@ def init_conditioner(
     precondition_1d: bool,
     dtype: Optional[chex.ArrayDType],
 ) -> Preconditioner:
-    # If no dtype is requested, store the preconditioner in the parameter's own dtype so that
-    # float64 parameters produce float64 preconditioners (and stay consistent across steps).
     if dtype is None:
         dtype = p.dtype
     if p.ndim == 1:
