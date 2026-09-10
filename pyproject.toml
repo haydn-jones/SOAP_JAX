@@ -25,4 +25,20 @@ quote-style = "double"
 indent-style = "space"
 
 [dependency-groups]
-dev = ["equinox>=0.13.2", "jax[cuda13]>0.6.0"]
+cuda13 = ["jax[cuda13]==0.11.1"]
+dev = [
+    "equinox==0.13.8",
+    "jax==0.11.1",
+    "flax==0.12.9",
+    "optax==0.2.8",
+    "orbax-checkpoint==0.12.4",
+    "pytest>=9,<10",
+    "ruff>=0.16,<0.17",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv.dependency-groups]
+dev = {requires-python = ">=3.12"}
+cuda13 = {requires-python = ">=3.12"}

@@ -1,0 +1,31 @@
+name: Compatibility
+on: [push, pull_request]
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.5"
+      - run: uv sync --locked --python 3.12
+      - run: uv run --no-sync ruff check src tests
+      - run: uv run --no-sync ruff format --check src tests
+      - name: Compare with v0.2.2
+        run: git show a7c92f174c49b13136294a94ae0d46266b4f671f:src/soap_jax/soap.py > /tmp/soap-v022.py
+      - run: uv run --no-sync pytest tests/test_nnx.py tests/test_parity.py
+        env:
+          JAX_PLATFORMS: cpu
+          SOAP_BASELINE: /tmp/soap-v022.py
+      - uses: actions/checkout@v4
+        with:
+          repository: HangJung97/PhiJAX
+          ref: 6b4ba66f1587498ec778ef766f9cb9291141b1a4
+          path: .phijax-validation
+      - run: uv pip install --python .venv/bin/python ./.phijax-validation
+      - run: uv run --no-sync pytest tests/test_phijax.py
+        env:
+          JAX_PLATFORMS: cpu
+          PHIJAX_SOURCE: .phijax-validation

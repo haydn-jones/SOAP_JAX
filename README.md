@@ -32,3 +32,11 @@ I've written it similarly to how optimizers in optax are defined, so you can als
 
 ## JAX Specific Information
 I did not implement merging of dimensions. I'll gladly take PR's improving other parts of the implementation as well.
+
+## PhiJAX / NNX compatibility
+
+This fork preserves parameter PyTrees through direct Optax updates and
+`nnx.Optimizer`. See [compatibility and checkpoint migration notes](COMPATIBILITY.md)
+for the pinned test environment, numerical parity tests, and PhiJAX validation.
+The optimizer-state layout changes; existing full optimizer checkpoints require
+migration or reinitialization.
